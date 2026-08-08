@@ -461,6 +461,52 @@ describe('SystemController GET /lsmod', () => {
     });
 });
 
+// ── rate-limit scopes ───────────────────────────────────────────────
+
+describe('SystemController public route rate limits', () => {
+    const rateLimitOf = (path: string) => {
+        const route = router.routes.find(
+            (r) => r.method === 'get' && r.path === path,
+        );
+        if (!route) throw new Error(`No GET ${path} route`);
+        return route.options.rateLimit as {
+            scope: string;
+            limit: number;
+            window: number;
+            key: string;
+        };
+    };
+
+    it('gives /healthcheck, /version and /whoarewe separate buckets', () => {
+        // These once shared one scope, which meant clients polling /version
+        // could exhaust the budget that liveness probes depend on. Keep them
+        // apart: a 429 on /healthcheck is read as an unhealthy node.
+        const scopes = [
+            rateLimitOf('/healthcheck').scope,
+            rateLimitOf('/version').scope,
+            rateLimitOf('/whoarewe').scope,
+        ];
+        expect(new Set(scopes).size).toBe(3);
+        expect(scopes).toEqual(['healthcheck', 'version', 'whoarewe']);
+    });
+
+    it('sizes the unauthenticated buckets for a shared address, not one client', () => {
+        // All three key on IP, and an IP is a NAT, a campus or a carrier
+        // gateway — the bucket aggregates everyone behind it, and the
+        // limiter counts region-wide rather than per process.
+        for (const path of ['/healthcheck', '/version', '/whoarewe']) {
+            const limit = rateLimitOf(path);
+            expect(limit.key).toBe('ip');
+            expect(limit.window).toBe(60_000);
+            expect(limit.limit).toBeGreaterThanOrEqual(6_000);
+        }
+        // Liveness polling is the most generous of the three by design.
+        expect(rateLimitOf('/healthcheck').limit).toBe(30_000);
+        expect(rateLimitOf('/version').limit).toBe(6_000);
+        expect(rateLimitOf('/whoarewe').limit).toBe(6_000);
+    });
+});
+
 // ── lifecycle ───────────────────────────────────────────────────────
 
 describe('SystemController.onServerPrepareShutdown', () => {

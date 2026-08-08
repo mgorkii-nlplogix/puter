@@ -180,12 +180,34 @@ export class DriverController extends PuterController {
     registerRoutes(router: PuterRouter): void {
         router.post(
             '/call',
-            { subdomain: 'api', requireAuth: true },
+            {
+                subdomain: 'api',
+                requireAuth: true,
+                // Per-driver limits do the real work; this is the coarse
+                // envelope, so that spreading calls across many interfaces
+                // can't dodge every individual bucket.
+                rateLimit: {
+                    scope: 'drivers-call',
+                    limit: 2000,
+                    window: 60_000,
+                    key: 'user',
+                },
+            },
             this.#handleCall,
         );
         router.get(
             '/list-interfaces',
-            { subdomain: 'api', requireAuth: true },
+            {
+                subdomain: 'api',
+                requireAuth: true,
+                // Static introspection output, read once at boot.
+                rateLimit: {
+                    scope: 'drivers-list-interfaces',
+                    limit: 60,
+                    window: 60_000,
+                    key: 'user',
+                },
+            },
             this.#handleListInterfaces,
         );
     }
@@ -305,19 +327,8 @@ export class DriverController extends PuterController {
         if (
             !(await checkDriverRateLimit(req, ifaceName, method, rateLimitSpec))
         ) {
-            // De-dupe on (iface, method) so a hot loop across many users
-            // aggregates as occurrences on a single low-severity alarm
-            // instead of fanning out one per user.
-            this.clients.alarm.create(
-                `driver_rate_limit_hit:${ifaceName}:${method}`,
-                `Driver rate limit hit on ${ifaceName}:${method}`,
-                {
-                    iface: ifaceName,
-                    method,
-                    userUuid: req.actor?.user?.uuid,
-                },
-                'info',
-            );
+            // Deliberately unalarmed: a caller spending its own budget is
+            // the limit working, not an incident. The 429 is the signal.
             throw new HttpError(429, 'Too many requests.', {
                 legacyCode: 'too_many_requests',
             });
@@ -340,16 +351,8 @@ export class DriverController extends PuterController {
                 concurrentSpec,
             );
             if (!handle.ok) {
-                this.clients.alarm.create(
-                    `driver_concurrent_limit_hit:${ifaceName}:${method}`,
-                    `Driver concurrency limit hit on ${ifaceName}:${method}`,
-                    {
-                        iface: ifaceName,
-                        method,
-                        userUuid: req.actor?.user?.uuid,
-                    },
-                    'info',
-                );
+                // Unalarmed for the same reason as the rate-limit rejection
+                // above: hitting a declared cap is the cap doing its job.
                 throw new HttpError(429, 'Too many concurrent requests.', {
                     legacyCode: 'too_many_requests',
                 });
